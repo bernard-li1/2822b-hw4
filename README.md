@@ -1,4 +1,4 @@
-## 💻 README: 2D Jacobi Solver Implementations
+## README: 2D Jacobi Solver Implementations
 
 This document describes the algorithms implemented in `task_1.cu` (Pure CUDA) and `task_2.cu` (MPI + CUDA) for solving the 2D Poisson equation using the **Jacobi iterative method**. The problem is defined on a 2D domain with a Dirichlet boundary condition based on the exact solution $u(x, y) = \sin(2\pi x) \sin(2\pi y)$.
 
