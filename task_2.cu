@@ -64,49 +64,12 @@ __global__ void init_local_grids(double* __restrict__ u, double* __restrict__ un
             unew[idx_local] = 0.0;
         }
     }
-
-    // Explicitly handle Top/Bottom Ghost Rows if they are Global Boundaries
-    // We need to ensure the ghost rows (row 0 and row local_N+1) contain u_exact 
-    // if they represent the global domain edge (y=0 or y=1).
     
-    // NOTE: The logic above iterates 1..local_N. We need to ensure the ghost rows 
-    // are initialized if they are global boundaries.
-    // However, standard practice is usually to init the whole padded grid or specific regions.
-    // Let's adhere to the pattern in the provided files, but ensuring data validity.
-    // The original files actually only initialized i_local 1 to local_N.
-    // This means d_u[0] and d_u[local_N+1] are UNINITIALIZED by the kernel above.
-    
-    // FIX: We add initialization for the ghost rows specifically if they are global boundaries.
     if (j < N) {
         // Top Ghost Row (Local 0) -> Global start - 1
         if (i_local == 0) {
              int i_global = global_start_row - 1;
-             // If this ghost row is actually the global boundary (i_global < 0 is technically outside, 
-             // but for 0-based mesh, the boundary is index 0).
-             // Actually, looking at the domain decomp:
-             // Rank 0 start_row=0. local i=1 is global 0. 
-             // So local i=0 is global -1. 
-             
-             // WAIT: The logic in main says: 
-             // "We only need to send/recv a single row... We send our top-most owned row (local row 1)"
-             // If Rank 0 has local rows 1..k. Global rows 0..k-1.
-             // The Init Kernel: i_global = global_start_row + i_local - 1;
-             // If Rank 0: i_local=1 -> i_global = 0 + 1 - 1 = 0. (Correct).
-             
-             // So, for Rank 0, the "Top Ghost Row" (i_local=0) corresponds to i_global = -1.
-             // This is outside the domain.
-             // However, the Jacobi kernel reads `u[local_i_load * N + local_j_load]`.
-             // If local_i_load is 0, we read the ghost row.
-             // If we are at the global boundary, do we need valid data in the ghost row?
-             // Boundary Condition: u(0, y) = 0 (since sin(0)=0).
-             // If i_local=1 is the boundary, the stencil at i_local=1 reads i_local=0.
-             // i_local=1 is FIXED (Dirichlet). The stencil is NOT APPLIED to i_local=1.
-             // The stencil check in Jacobi is: `if (i_global > 0 && i_global < N-1)`
-             
-             // THEREFORE: The ghost rows at global boundaries are never read by the stencil 
-             // because the stencil is skipped for the boundary rows themselves.
-             // So, initializing them is not strictly required for correctness, 
-             // PROVIDED we don't update the boundary rows (i_local=1) with garbage.
+        
         }
     }
 }
