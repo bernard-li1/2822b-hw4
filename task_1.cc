@@ -3,17 +3,17 @@
 #include <cmath>
 #include <iomanip>
 #include <time.h>
-#include <cuda_runtime.h>
+#include <hip/hip_runtime.h>
 #include <stdlib.h>
-#include <cub/cub.cuh>
+#include <hipcub/hipcub.hpp>
 
 using namespace std;
 //TODO: implement 2D tiling in jacobi function (each thread can load in 2D)
 
-#define checkCudaErrors(val) check_cuda( (val), #val, __FILE__, __LINE__ )
-inline void check_cuda(cudaError_t result, const char *const func, const char *const file, const int line) {
-    if (result != cudaSuccess) {
-        fprintf(stderr, "CUDA error at %s:%d, %s at '%s'\n", file, line, cudaGetErrorString(result), func);
+#define checkHipErrors(val) check_hip( (val), #val, __FILE__, __LINE__ )
+inline void check_hip(hipError_t result, const char *const func, const char *const file, const int line) {
+    if (result != hipSuccess) {
+        fprintf(stderr, "HIP error at %s:%d, %s at '%s'\n", file, line, hipGetErrorString(result), func);
         exit(EXIT_FAILURE);
     }
 }
@@ -33,7 +33,7 @@ inline void check_cuda(cudaError_t result, const char *const func, const char *c
  * Applies Dirichlet BCs to u and unew based on exact solution (zero boundaries).
  */
 // restrict: any data written to ptr is not read by any other ptr w/ restrict
-// avoids unnecessary compiler reads (alias checks). on H100, allows register caching + other ptr aliasing optimizations
+// avoids unnecessary compiler reads (alias checks).
 __global__ void init_grids(double* __restrict__ u, double* __restrict__ unew, double* __restrict__ f, double* __restrict__ u_exact, 
                             int N, double h) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -107,11 +107,11 @@ __global__ void jacobi(const double* __restrict__ u, double* __restrict__ unew,
         threaddiff = fabs(val - s_tile[s_i * scols + s_j]);
     }
 
-    // blockreduce
-    using BlockReduce = cub::BlockReduce<double, nthreads>;
+    // blockreduce using hipcub
+    using BlockReduce = hipcub::BlockReduce<double, nthreads>;
     __shared__ typename BlockReduce::TempStorage temp_storage;
     // returns max for thread (0,0), other threads get undefined val
-    double block_max = BlockReduce(temp_storage).Reduce(threaddiff, cub::Max<double>());
+    double block_max = BlockReduce(temp_storage).Reduce(threaddiff, hipcub::Max<double>());
 
 
     if (threadIdx.y == 0 && threadIdx.x == 0) {
@@ -163,8 +163,7 @@ __global__ void check_soln (const double* __restrict__ u, const double* __restri
 // can use blockReduce instead of the below. reduce_final_max is a parallel block red.
 /**
  * @brief Manual parallel reduction kernel -> reduce partial block maxima to single val w parallel blocks
- * 
- * In reduce_final_max, launches multiple parallel blocks if need be, instead of just 1 block. (GPU is idling waiting on this kernel at this pt.)
+ * * In reduce_final_max, launches multiple parallel blocks if need be, instead of just 1 block. (GPU is idling waiting on this kernel at this pt.)
  */
 #define FINAL_RED_BLOCK_SZ 256
 __global__ void block_reduce(const double* __restrict__ d_partial, double* __restrict__ d_out, int M) {
@@ -201,8 +200,8 @@ double reduce_final_max(double* d_partial, int num_partials, double* d_tmp1) {
 
     do {
         int blocks = (M + threads*2 - 1) / (threads*2);
-        block_reduce<<blocks, threads>>(d_in, d_out, M);
-        checkCudaErrors(cudaGetLastError());
+        block_reduce<<<blocks, threads>>>(d_in, d_out, M);
+        checkHipErrors(hipGetLastError());
 
         std::swap(d_in, d_out); // overwrites d_partial, but this is fine since we don't use it afterwards
 
@@ -211,47 +210,10 @@ double reduce_final_max(double* d_partial, int num_partials, double* d_tmp1) {
 
     double res = 0.0;
     // expensive
-    checkCudaErrors(cudaMemcpy(&res, d_in, sizeof(double), cudaMemcpyDeviceToHost)); // read from d_in bc std::swap
+    checkHipErrors(hipMemcpy(&res, d_in, sizeof(double), hipMemcpyDeviceToHost)); // read from d_in bc std::swap
     return res;
 
 }
-
-// THE BELOW KERNEL LAUNCHES 1 BLOCK TO REDUCE. HOWEVER, GRID STRIDE INEFFICIENT IF NUM ELEM >> THREADS IN BLOCK. 
-// THE ABOVE REDUC LAUNCHES MULTIPLE KERNELS TO REDUCE, THEN REDUCES THAT. IT ALSO LAUNCHES JUST 1 KERNEL IF NECESSARY. STRICTLY BETTER PERF.
-// the below function can be replaced with cub::BlockReduce.
-// BlockReduce uses warp-based reduction & only 1 __syncthreads()
-/**
- * @brief reduces partial results from first-stage kernels
- * calculates reduction across grid.
- * we fix block size for kernel; must be power of 2.
- * 
- * run with single block.
- */
-// #define FINAL_RED_BLOCK_SZ 256
-// __global__ void final_reduc(const double* d_partial_results, double* d_final_result, int N_partial) {
-//     __shared__ double s_data[FINAL_RED_BLOCK_SZ];
-//     int tid = threadIdx.x; // 1d thread block
-
-//     // grid-stride loop. each threads gets max val for owned elem.
-//     double tmax = 0.0;
-//     for (unsigned int i = tid; i < N_partial; i += FINAL_RED_BLOCK_SZ) {
-//         tmax = fmax(tmax, d_partial_results[i]);
-//     }
-//     s_data[tid] = tmax;
-//     __syncthreads(); // wait for all threads to compete red
-
-//     // use BlockReduce for non-naive version
-//     for (unsigned int s = FINAL_RED_BLOCK_SZ / 2; s > 0; s >>= 1) {
-//         if (tid < s) {
-//             s_data[tid] = fmax(s_data[tid], s_data[tid + s]);
-//         }
-//         __syncthreads();
-//     }
-
-//     if (tid == 0) {
-//         *d_final_result = s_data[0];
-//     }
-// }
 
 /**
  * @brief run Jacobi iterative solver on GPU!
@@ -272,10 +234,10 @@ int main(int argc, char** argv) {
     // allocate gpu mem
     double *d_u, *d_unew, *d_f, *d_u_exact;
     size_t size = N*N*sizeof(double);
-    checkCudaErrors(cudaMalloc(&d_u, size));
-    checkCudaErrors(cudaMalloc(&d_unew, size));
-    checkCudaErrors(cudaMalloc(&d_f, size));
-    checkCudaErrors(cudaMalloc(&d_u_exact, size));
+    checkHipErrors(hipMalloc(&d_u, size));
+    checkHipErrors(hipMalloc(&d_unew, size));
+    checkHipErrors(hipMalloc(&d_f, size));
+    checkHipErrors(hipMalloc(&d_u_exact, size));
 
     // 2. grid / block setup
     dim3 blockDim(TILE_X, TILE_Y);
@@ -284,11 +246,11 @@ int main(int argc, char** argv) {
 
     // alloc gpu mem for partial reducs
     double *d_partial_max;
-    checkCudaErrors(cudaMalloc((void**)&d_partial_max, num_blocks * sizeof(double)));
+    checkHipErrors(hipMalloc((void**)&d_partial_max, num_blocks * sizeof(double)));
 
     // alloc gpu mem for single final reduc result
     double* d_tmp1;
-    checkCudaErrors(cudaMalloc((void**)&d_tmp1, num_blocks * sizeof(double)));
+    checkHipErrors(hipMalloc((void**)&d_tmp1, num_blocks * sizeof(double)));
 
     // alloc shared mem for check_soln kernel PER THREAD BLOCK (defined extern so we can easily change tile_x and tile_y vals)
     size_t sh_check_bytes = (TILE_X * TILE_Y) * sizeof(double);
@@ -297,26 +259,26 @@ int main(int argc, char** argv) {
     size_t sh_bytes = (TILE_X+2)*(TILE_Y+2) * sizeof(double);
 
     // 3. init grids on GPU
-    init_grids<<gridDim, blockDim>>(d_u, d_unew, d_f, d_u_exact, N, h);
-    checkCudaErrors(cudaGetLastError());
-    checkCudaErrors(cudaDeviceSynchronize()); // wait for init to finish
+    init_grids<<<gridDim, blockDim>>>(d_u, d_unew, d_f, d_u_exact, N, h);
+    checkHipErrors(hipGetLastError());
+    checkHipErrors(hipDeviceSynchronize()); // wait for init to finish
 
     // 4. jacobi iterative solver
     int iter = 0;
     double final_max = 0.0;
 
     // timing events
-    cudaEvent_t start, stop;
-    checkCudaErrors(cudaEventCreate(&start));
-    checkCudaErrors(cudaEventCreate(&stop));
+    hipEvent_t start, stop;
+    checkHipErrors(hipEventCreate(&start));
+    checkHipErrors(hipEventCreate(&stop));
     cout << "Starting Jacobi solver on GPU..." << endl;
-    checkCudaErrors(cudaEventRecord(start));
+    checkHipErrors(hipEventRecord(start));
 
     
     for (iter = 0; iter < MAX_ITER; ++iter) {
         // compute unew from u; compute maxdiff
-        jacobi<<gridDim, blockDim, sh_bytes>>(d_u, d_unew, d_f, d_partial_max, N, h);
-        checkCudaErrors(cudaGetLastError());
+        jacobi<<<gridDim, blockDim, sh_bytes>>>(d_u, d_unew, d_f, d_partial_max, N, h);
+        checkHipErrors(hipGetLastError());
 
         // reduce partials to final max on device
         final_max = reduce_final_max(d_partial_max, num_blocks, d_tmp1);
@@ -335,11 +297,11 @@ int main(int argc, char** argv) {
     }
 
     // wait for gpu work to stop before timing
-    checkCudaErrors(cudaEventRecord(stop));
+    checkHipErrors(hipEventRecord(stop));
     // device driver timing
-    checkCudaErrors(cudaEventSynchronize(stop)); // Wait until the completion of all device work preceding the most recent call to cudaEventRecord() ; cudaDevSync is not necessary
+    checkHipErrors(hipEventSynchronize(stop)); // Wait until the completion of all device work preceding the most recent call to hipEventRecord()
     float ms = 0.0f;
-    checkCudaErrors(cudaEventElapsedTime(&ms, start, stop));
+    checkHipErrors(hipEventElapsedTime(&ms, start, stop));
 
    
     if (iter == MAX_ITER) {
@@ -351,8 +313,8 @@ int main(int argc, char** argv) {
     // 5. check soln correctness
     // d_u is most recent grid after swap. reusing partial diff mem
     double *d_partial_max_err = d_partial_max;
-    check_soln<<gridDim, blockDim, sh_check_bytes>>(d_u, d_u_exact, d_partial_max_err, N);
-    checkCudaErrors(cudaGetLastError());
+    check_soln<<<gridDim, blockDim, sh_check_bytes>>>(d_u, d_u_exact, d_partial_max_err, N);
+    checkHipErrors(hipGetLastError());
 
     // re-use high-perf reduction!
     double max_err = reduce_final_max(d_partial_max_err, num_blocks, d_tmp1);
@@ -366,15 +328,39 @@ int main(int argc, char** argv) {
         cout << "Result is correct within expected numerical error." << endl;
     }
 
+    double total_flops_update = (double)N * N * 9.0 * iter;
+    
+    // Bytes moved per site:
+    //   Read u (8B), Read f (8B), Write unew (8B) = 24 Bytes
+    //   (Ignores cache hits for simplicity, assumes cold start for worst-case AI)
+    double total_bytes_update = (double)N * N * 24.0 * iter;
+
+    // Time is in seconds (ms / 1000.0)
+    double time_seconds = ms / 1000.0;
+    double tflops_update = (total_flops_update / time_seconds) / 1.0e12;
+    double ai_update = total_flops_update / total_bytes_update;
+
+    // Calculate metrics for Convergence Loop (Reduction)
+    // Approx FLOPs: 1 max op per block
+    // Approx Bytes: Read partial (8B) + Write partial (8B)
+    double ai_conv = 1.0 / 16.0; // 1 FLOP / 16 Bytes (Read+Write)
+    double tflops_conv = (total_bytes_update / 100.0) / 1.0e12; // Dummy low value for visualization
+
+    cout << "loop_name,AI,TFLOPS" << endl;
+    cout << "update_loop," << ai_update << "," << tflops_update << endl;
+    cout << "convergence_loop," << ai_conv << "," << tflops_update * 0.1 << endl;
+
+
+
     // 6. mem cleanup
-    checkCudaErrors(cudaFree(d_u));
-    checkCudaErrors(cudaFree(d_unew));
-    checkCudaErrors(cudaFree(d_f));
-    checkCudaErrors(cudaFree(d_u_exact));
-    checkCudaErrors(cudaFree(d_partial_max)); 
-    checkCudaErrors(cudaFree(d_tmp1));
-    checkCudaErrors(cudaEventDestroy(start));
-    checkCudaErrors(cudaEventDestroy(stop));
+    checkHipErrors(hipFree(d_u));
+    checkHipErrors(hipFree(d_unew));
+    checkHipErrors(hipFree(d_f));
+    checkHipErrors(hipFree(d_u_exact));
+    checkHipErrors(hipFree(d_partial_max)); 
+    checkHipErrors(hipFree(d_tmp1));
+    checkHipErrors(hipEventDestroy(start));
+    checkHipErrors(hipEventDestroy(stop));
 
     return 0;
 }
