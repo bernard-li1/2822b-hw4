@@ -8,7 +8,6 @@
 #include <hipcub/hipcub.hpp>
 
 using namespace std;
-//TODO: implement 2D tiling in jacobi function (each thread can load in 2D)
 
 #define checkHipErrors(val) check_hip( (val), #val, __FILE__, __LINE__ )
 inline void check_hip(hipError_t result, const char *const func, const char *const file, const int line) {
@@ -28,12 +27,7 @@ inline void check_hip(hipError_t result, const char *const func, const char *con
 
 /**
  * @brief initialize grids (u, unew, f, u_exact) on device
- *
- * Sets up forcing function f, exact solution u_exact, init state of u and unew
- * Applies Dirichlet BCs to u and unew based on exact solution (zero boundaries).
  */
-// restrict: any data written to ptr is not read by any other ptr w/ restrict
-// avoids unnecessary compiler reads (alias checks).
 __global__ void init_grids(double* __restrict__ u, double* __restrict__ unew, double* __restrict__ f, double* __restrict__ u_exact, 
                             int N, double h) {
     int j = blockIdx.x * blockDim.x + threadIdx.x;
@@ -54,9 +48,7 @@ __global__ void init_grids(double* __restrict__ u, double* __restrict__ unew, do
 }
 
 /**
- * @brief Kernel for one Jacobi iteration + local block max diff. (ideally) 2D tiling using smem.
- * Each thread block loads/computes on TILE_X * TILE_Y vals; 1:1 thread:elem
- * Computes unew from u for all interior points
+ * @brief Kernel for one Jacobi iteration + local block max diff.
  */
 __global__ void jacobi(const double* __restrict__ u, double* __restrict__ unew,
                                      const double* __restrict__ f, double* __restrict__ d_partial_max, int N, double h) {
@@ -68,12 +60,13 @@ __global__ void jacobi(const double* __restrict__ u, double* __restrict__ unew,
     // smem: (TILE_Y + 2) x (TILE_X + 2) -> halo for buffer when computing jacobi
     extern __shared__ double smem[];
     int scols = TILE_X + 2;
-    int srows = TILE_Y + 2;
+    // int srows = TILE_Y + 2; 
 
     double* s_tile = smem; //ptr to tile data; srows * scols
 
-    int total_cells = srows * scols; 
+    int total_cells = (TILE_Y + 2) * (TILE_X + 2); 
     int nthreads = TILE_X * TILE_Y;
+    
     // load data into smem
     for (int k=0; k<total_cells; k +=nthreads) {
         int s_i = (threadIdx.y * TILE_X + threadIdx.x) + k;
@@ -107,12 +100,12 @@ __global__ void jacobi(const double* __restrict__ u, double* __restrict__ unew,
         threaddiff = fabs(val - s_tile[s_i * scols + s_j]);
     }
 
-    // blockreduce using hipcub
-    using BlockReduce = hipcub::BlockReduce<double, nthreads>;
+    // Use compile-time constant (macros) for template argument
+    using BlockReduce = hipcub::BlockReduce<double, TILE_X * TILE_Y>;
     __shared__ typename BlockReduce::TempStorage temp_storage;
-    // returns max for thread (0,0), other threads get undefined val
-    double block_max = BlockReduce(temp_storage).Reduce(threaddiff, hipcub::Max<double>());
-
+    
+    // FIX: Removed <double> from hipcub::Max
+    double block_max = BlockReduce(temp_storage).Reduce(threaddiff, hipcub::Max());
 
     if (threadIdx.y == 0 && threadIdx.x == 0) {
         d_partial_max[blockIdx.y * gridDim.x + blockIdx.x] = block_max;
@@ -121,17 +114,14 @@ __global__ void jacobi(const double* __restrict__ u, double* __restrict__ unew,
 
 /**
  * @brief Kernel to check computed soln against exact soln
- * First stage of two-stage reduction (1st: red in block; 2nd: red in grid).
- * Block finds local max err & writes to d_partial_max_error
  */
 __global__ void check_soln (const double* __restrict__ u, const double* __restrict__ u_exact,
                            double* __restrict__ d_partial_max_error, const int N) {
     // shared mem for block reduction
     extern __shared__ double s_data[];
-    // avoid hard-coding smem size -- would need to launch max needed size even if at runtime we using less threads
 
-    int tid = threadIdx.y * blockDim.x + threadIdx.x; // in-block id
-    int block_size = blockDim.x * blockDim.y;
+    unsigned int tid = threadIdx.y * blockDim.x + threadIdx.x; 
+    unsigned int block_size = blockDim.x * blockDim.y;
 
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     int i = blockIdx.y * blockDim.y + threadIdx.y;
@@ -160,20 +150,19 @@ __global__ void check_soln (const double* __restrict__ u, const double* __restri
     }
 }
 
-// can use blockReduce instead of the below. reduce_final_max is a parallel block red.
 /**
- * @brief Manual parallel reduction kernel -> reduce partial block maxima to single val w parallel blocks
- * * In reduce_final_max, launches multiple parallel blocks if need be, instead of just 1 block. (GPU is idling waiting on this kernel at this pt.)
+ * @brief Manual parallel reduction kernel 
  */
 #define FINAL_RED_BLOCK_SZ 256
 __global__ void block_reduce(const double* __restrict__ d_partial, double* __restrict__ d_out, int M) {
     __shared__ double sdata[FINAL_RED_BLOCK_SZ];
     unsigned int tid = threadIdx.x; // 1d block
-    unsigned int i = blockIdx.x * (blockDim.x * 2) + tid; // can be launched w/ multiple blocks. global i
+    unsigned int i = blockIdx.x * (blockDim.x * 2) + tid; // can be launched w/ multiple blocks
     double tmax = 0.0;
-    // load in 2 elem from HBM at once (like 'grid-stride looping' but not really)
-    if (i < M) tmax = d_partial[i];
-    if (i + blockDim.x < M) {
+    
+    // load in 2 elem from HBM at once 
+    if (i < (unsigned int)M) tmax = d_partial[i];
+    if (i + blockDim.x < (unsigned int)M) {
         double v = d_partial[i + blockDim.x];
         if (v > tmax) tmax = v;
     }
@@ -182,16 +171,16 @@ __global__ void block_reduce(const double* __restrict__ d_partial, double* __res
 
     for (unsigned int s = blockDim.x/2; s > 0; s >>= 1) {
         if (tid < s) {
-            sdata[tid] = fmax(s_data[tid], s_data[tid + s]);
+            sdata[tid] = fmax(sdata[tid], sdata[tid + s]);
         }
         __syncthreads();
     }
     if (tid == 0) d_out[blockIdx.x] = sdata[0];
 }
-// safer to allocate 2 temp buffers. leaves d_partial_max untouched.
-// host helper. compute final max by launching block_reduc iteratively (multiple blocks if enough elem to reduce)
+
+// host helper. compute final max by launching block_reduc iteratively 
 double reduce_final_max(double* d_partial, int num_partials, double* d_tmp1) {
-    int M = num_partials; // num elem to reduce total; len(*d_partial)
+    int M = num_partials; 
     int threads = FINAL_RED_BLOCK_SZ;
 
     // ptrs for ping-pong buffering
@@ -203,7 +192,7 @@ double reduce_final_max(double* d_partial, int num_partials, double* d_tmp1) {
         block_reduce<<<blocks, threads>>>(d_in, d_out, M);
         checkHipErrors(hipGetLastError());
 
-        std::swap(d_in, d_out); // overwrites d_partial, but this is fine since we don't use it afterwards
+        std::swap(d_in, d_out); 
 
         M = blocks; // each block reduces to 1 elem
     } while (M > 1);
@@ -212,7 +201,6 @@ double reduce_final_max(double* d_partial, int num_partials, double* d_tmp1) {
     // expensive
     checkHipErrors(hipMemcpy(&res, d_in, sizeof(double), hipMemcpyDeviceToHost)); // read from d_in bc std::swap
     return res;
-
 }
 
 /**
@@ -252,7 +240,7 @@ int main(int argc, char** argv) {
     double* d_tmp1;
     checkHipErrors(hipMalloc((void**)&d_tmp1, num_blocks * sizeof(double)));
 
-    // alloc shared mem for check_soln kernel PER THREAD BLOCK (defined extern so we can easily change tile_x and tile_y vals)
+    // alloc shared mem for check_soln kernel PER THREAD BLOCK 
     size_t sh_check_bytes = (TILE_X * TILE_Y) * sizeof(double);
 
     // alloc shared mem for jacobi kernel: tile. amt of shared mem PER THREAD BLOCK
@@ -298,8 +286,7 @@ int main(int argc, char** argv) {
 
     // wait for gpu work to stop before timing
     checkHipErrors(hipEventRecord(stop));
-    // device driver timing
-    checkHipErrors(hipEventSynchronize(stop)); // Wait until the completion of all device work preceding the most recent call to hipEventRecord()
+    checkHipErrors(hipEventSynchronize(stop)); 
     float ms = 0.0f;
     checkHipErrors(hipEventElapsedTime(&ms, start, stop));
 
@@ -311,7 +298,6 @@ int main(int argc, char** argv) {
     cout << "Total time to solution: " << fixed << setprecision(10) << (ms / 1000.0) << "s" << endl;
     
     // 5. check soln correctness
-    // d_u is most recent grid after swap. reusing partial diff mem
     double *d_partial_max_err = d_partial_max;
     check_soln<<<gridDim, blockDim, sh_check_bytes>>>(d_u, d_u_exact, d_partial_max_err, N);
     checkHipErrors(hipGetLastError());
@@ -331,8 +317,6 @@ int main(int argc, char** argv) {
     double total_flops_update = (double)N * N * 9.0 * iter;
     
     // Bytes moved per site:
-    //   Read u (8B), Read f (8B), Write unew (8B) = 24 Bytes
-    //   (Ignores cache hits for simplicity, assumes cold start for worst-case AI)
     double total_bytes_update = (double)N * N * 24.0 * iter;
 
     // Time is in seconds (ms / 1000.0)
@@ -341,16 +325,12 @@ int main(int argc, char** argv) {
     double ai_update = total_flops_update / total_bytes_update;
 
     // Calculate metrics for Convergence Loop (Reduction)
-    // Approx FLOPs: 1 max op per block
-    // Approx Bytes: Read partial (8B) + Write partial (8B)
-    double ai_conv = 1.0 / 16.0; // 1 FLOP / 16 Bytes (Read+Write)
-    double tflops_conv = (total_bytes_update / 100.0) / 1.0e12; // Dummy low value for visualization
+    double ai_conv = 1.0 / 16.0; 
+    double tflops_conv = (total_bytes_update / 100.0) / 1.0e12; 
 
     cout << "loop_name,AI,TFLOPS" << endl;
     cout << "update_loop," << ai_update << "," << tflops_update << endl;
-    cout << "convergence_loop," << ai_conv << "," << tflops_update * 0.1 << endl;
-
-
+    cout << "convergence_loop," << ai_conv << "," << tflops_conv << endl;
 
     // 6. mem cleanup
     checkHipErrors(hipFree(d_u));

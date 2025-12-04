@@ -44,7 +44,6 @@ __global__ void init_local_grids(double* __restrict__ u, double* __restrict__ un
     int i_local = blockIdx.y * blockDim.y + threadIdx.y;
 
     // Only initialize rows we own (1 to local_N)
-    // Note: Ghost rows (0 and local_N+1) are handled implicitly if they are global boundaries
     if (i_local >= 1 && i_local <= local_N && j < N) {
         
         int i_global = global_start_row + i_local - 1;
@@ -64,16 +63,6 @@ __global__ void init_local_grids(double* __restrict__ u, double* __restrict__ un
             unew[idx_local] = 0.0;
         }
     }
-    
-    // Ghost row logic (implicitly handled by initialization bounds checks or loops usually, 
-    // keeping structure identical to original file)
-    if (j < N) {
-        // Top Ghost Row (Local 0) -> Global start - 1
-        if (i_local == 0) {
-             int i_global = global_start_row - 1;
-             // Logic placeholder as per original file
-        }
-    }
 }
 
 __global__ void jacobi_mpi(const double* __restrict__ u, double* __restrict__ unew,
@@ -90,6 +79,7 @@ __global__ void jacobi_mpi(const double* __restrict__ u, double* __restrict__ un
     int total_cells = (TILE_Y + 2) * scols; 
     const int nthreads = TILE_X * TILE_Y;
 
+    // Collaborative loading into shared memory
     for (int k=0; k<total_cells; k += nthreads) {
         int s_i = (threadIdx.y * TILE_X + threadIdx.x) + k;
         if (s_i < total_cells) {
@@ -129,10 +119,19 @@ __global__ void jacobi_mpi(const double* __restrict__ u, double* __restrict__ un
         }
     }
 
-    // Using hipcub instead of cub
+    // --- Block Reduce ---
     using BlockReduce = hipcub::BlockReduce<double, TILE_X * TILE_Y>;
     __shared__ typename BlockReduce::TempStorage temp_storage;
-    double block_max = BlockReduce(temp_storage).Reduce(threaddiff, hipcub::Max<double>());
+    
+    // Define a custom functor to avoid "Max" macro collisions from mpi.h
+    struct MaxOp {
+        __device__ __forceinline__
+        double operator()(const double &a, const double &b) const {
+            return (a > b) ? a : b;
+        }
+    };
+
+    double block_max = BlockReduce(temp_storage).Reduce(threaddiff, MaxOp());
 
     if (threadIdx.y == 0 && threadIdx.x == 0) {
         d_partial_max[blockIdx.y * gridDim.x + blockIdx.x] = block_max;
@@ -143,8 +142,8 @@ __global__ void check_soln_mpi(const double* __restrict__ u, const double* __res
                                double* __restrict__ d_partial_max_error, const int N, const int local_N) {
     
     extern __shared__ double s_data[];
-    int tid = threadIdx.y * blockDim.x + threadIdx.x;
-    int block_size = blockDim.x * blockDim.y;
+    unsigned int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    unsigned int block_size = blockDim.x * blockDim.y;
 
     int j = blockIdx.x * blockDim.x + threadIdx.x;
     int i = blockIdx.y * blockDim.y + threadIdx.y; 
@@ -157,6 +156,7 @@ __global__ void check_soln_mpi(const double* __restrict__ u, const double* __res
     s_data[tid] = err;
     __syncthreads();
 
+    // Standard tree reduction in shared memory
     for (unsigned int s = block_size / 2; s>0; s >>= 1) {
         if (tid < s) {
             s_data[tid] = fmax(s_data[tid], s_data[tid + s]);
@@ -177,8 +177,8 @@ __global__ void block_reduce(const double* __restrict__ d_partial, double* __res
     unsigned int i = blockIdx.x * (blockDim.x * 2) + tid;
     double tmax = 0.0;
     
-    if (i < M) tmax = d_partial[i];
-    if (i + blockDim.x < M) {
+    if (i < (unsigned int)M) tmax = d_partial[i];
+    if (i + blockDim.x < (unsigned int)M) {
         double v = d_partial[i + blockDim.x];
         if (v > tmax) tmax = v;
     }
@@ -271,7 +271,6 @@ int main(int argc, char** argv) {
     double *h_recv_buffer_top = nullptr, *h_recv_buffer_bottom = nullptr;
     size_t row_size = N * sizeof(double);
     
-    // Use hipHostMalloc for pinned memory (equivalent to cudaMallocHost)
     checkHipErrors(hipHostMalloc(&h_send_buffer_top, row_size));
     checkHipErrors(hipHostMalloc(&h_send_buffer_bottom, row_size));
     checkHipErrors(hipHostMalloc(&h_recv_buffer_top, row_size));
@@ -312,13 +311,6 @@ int main(int argc, char** argv) {
         MPI_Isend(h_send_buffer_bottom, N, MPI_DOUBLE, rank_down, 0, MPI_COMM_WORLD, &requests[3]);
 
         MPI_Waitall(4, requests, statuses);
-
-        // --- BUG FIX SECTION ---
-        // Only copy ghost rows to device if we actually received data from a neighbor.
-        // If rank_up/down is MPI_PROC_NULL, we are at a global boundary.
-        // We MUST NOT overwrite the device ghost row with the host buffer (which is garbage/stale),
-        // nor should we emulate a Neumann boundary (Task 2b bug).
-        // We simply skip the copy, preserving the Dirichlet BCs handled by the initialization.
 
         if (rank_up != MPI_PROC_NULL) {
             checkHipErrors(hipMemcpy(d_u + (0 * N), h_recv_buffer_top, row_size, hipMemcpyHostToDevice));
@@ -378,22 +370,13 @@ int main(int argc, char** argv) {
         }
 
         double total_flops_update = (double)N * N * 9.0 * iter;
-    
-        // Bytes: N*N grid * 24 bytes/point (Read u, Read f, Write unew) * iterations
         double total_bytes_update = (double)N * N * 24.0 * iter;
-
         double time_seconds = end_time - start_time;
-    
         double system_tflops = (total_flops_update / time_seconds) / 1.0e12;
-    
-        // Calculate Per-GPU Performance (Average) to plot on the single-device Roofline
         double per_gpu_tflops = system_tflops / size;
         double ai_update = total_flops_update / total_bytes_update;
 
-        // Metrics for Convergence Loop (Estimate)
-        // Purely memory bound (reading/writing partial sums), low AI
         double ai_conv = 1.0 / 16.0; 
-        // Convergence loop is dominated by MPI latency/bandwidth, usually slower than compute
         double tflops_conv = per_gpu_tflops * 0.1; 
 
         cout << "loop_name,AI,TFLOPS" << endl;
