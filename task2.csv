@@ -1,0 +1,3 @@
+loop_name,AI,TFLOPS
+update_loop,0.3750000000,0.0025854353
+convergence_loop,0.1250000000,0.0000005348

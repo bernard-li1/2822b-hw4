@@ -4,11 +4,9 @@ import pandas as pd
 import argparse
 import os
 
-# --- Hardware Specifications (for NVIDIA H100 SXM5 - FP64 theoretical peak) ---
-# Memory Bandwidth: ~3.35 TB/s
-PEAK_MEMORY_BW = 3350  # GB/s 
-# FP64 FLOPs: ~33.5 TFLOP/s
-PEAK_FLOP_RATE = 33500 # GFLOP/s 
+# --- Hardware Specifications (for AMD Instinct MI300X) ---
+PEAK_MEMORY_BW = 5300.0  # GB/s 
+PEAK_FLOP_RATE = 163400.0  # GFLOP/s 
 RIDGE_POINT = PEAK_FLOP_RATE / PEAK_MEMORY_BW
 # ---
 
@@ -105,7 +103,7 @@ def create_roofline_plot(task1_csv, task2_csv, output_file):
     plt.text(50, 20000, 'Compute Bound', fontsize=12, ha='center', bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue", alpha=0.5))
     
     plt.xlim(0.01, 1000)
-    plt.ylim(10, 40000)
+    plt.ylim(0.1, 40000)
     
     plt.tight_layout()
     plt.savefig(output_file, dpi=300, bbox_inches='tight')

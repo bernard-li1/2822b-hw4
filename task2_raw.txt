@@ -1,5 +1,9 @@
-Running Jacobi solver for N = 201 x 201 for 100000 iterations
-Starting Jacobi solver on GPU...
+Running MPI+HIP Jacobi solver for N = 201 with max iterations = 100000 on 4 ranks.
+Rank 1 is using GPU 0
+Rank 2 is using GPU 0
+Rank 3 is using GPU 0
+Total HIP devices found: 1
+Rank 0 is using GPU 0
 Iter:     0, Max Diff: 9.858204e-01
 Iter:   500, Max Diff: 9.858204e-01
 Iter:  1000, Max Diff: 9.858204e-01
@@ -202,9 +206,10 @@ Iter: 99000, Max Diff: 9.858204e-01
 Iter: 99500, Max Diff: 9.858204e-01
 Solver stopped after reached max iterations (100000).
 Final Max Diff: 9.858204e-01
-Total time to solution: 4.1232368164s
+Total time to solution: 39.6356737620s
+Iterations: 100000
 Maximum Absolute Error: 0.0000822508
 Result is correct within expected numerical error.
 loop_name,AI,TFLOPS
-update_loop,375000000000.0000000000,0.0550795692
-convergence_loop,0.1250000000,0.0000092550
+update_loop,0.3750000000,0.0025854353
+convergence_loop,0.1250000000,0.0000005348

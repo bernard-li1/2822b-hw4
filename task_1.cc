@@ -255,21 +255,42 @@ int main(int argc, char** argv) {
     int iter = 0;
     double final_max = 0.0;
 
-    // timing events
+    // timing events (Overall)
     hipEvent_t start, stop;
     checkHipErrors(hipEventCreate(&start));
     checkHipErrors(hipEventCreate(&stop));
+
+    // timing events (Per-Kernel Analysis for Roofline)
+    hipEvent_t k_start, k_stop;
+    checkHipErrors(hipEventCreate(&k_start));
+    checkHipErrors(hipEventCreate(&k_stop));
+    float total_update_ms = 0.0f;
+    float total_conv_ms = 0.0f;
+
     cout << "Starting Jacobi solver on GPU..." << endl;
     checkHipErrors(hipEventRecord(start));
 
     
     for (iter = 0; iter < MAX_ITER; ++iter) {
-        // compute unew from u; compute maxdiff
+        
+        // --- 1. Update Step (Jacobi Kernel) ---
+        checkHipErrors(hipEventRecord(k_start));
         jacobi<<<gridDim, blockDim, sh_bytes>>>(d_u, d_unew, d_f, d_partial_max, N, h);
+        checkHipErrors(hipEventRecord(k_stop));
+        checkHipErrors(hipEventSynchronize(k_stop));
+        float dt = 0.0f;
+        checkHipErrors(hipEventElapsedTime(&dt, k_start, k_stop));
+        total_update_ms += dt;
+        
         checkHipErrors(hipGetLastError());
 
-        // reduce partials to final max on device
+        // --- 2. Convergence Step (Reduction) ---
+        checkHipErrors(hipEventRecord(k_start));
         final_max = reduce_final_max(d_partial_max, num_blocks, d_tmp1);
+        checkHipErrors(hipEventRecord(k_stop));
+        checkHipErrors(hipEventSynchronize(k_stop));
+        checkHipErrors(hipEventElapsedTime(&dt, k_start, k_stop));
+        total_conv_ms += dt;
 
         swap(d_u, d_unew);
 
@@ -284,7 +305,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    // wait for gpu work to stop before timing
+    // wait for gpu work to stop before timing (Total Wall Time)
     checkHipErrors(hipEventRecord(stop));
     checkHipErrors(hipEventSynchronize(stop)); 
     float ms = 0.0f;
@@ -314,19 +335,30 @@ int main(int argc, char** argv) {
         cout << "Result is correct within expected numerical error." << endl;
     }
 
+    // --- Performance Metrics for Roofline ---
+
+    // UPDATE LOOP METRICS
+    // FLOPs: 7 stencil + 2 residual = 9 per site
     double total_flops_update = (double)N * N * 9.0 * iter;
-    
-    // Bytes moved per site:
+    // Bytes: Read u (8), Read f (8), Write unew (8) = 24 per site
     double total_bytes_update = (double)N * N * 24.0 * iter;
+    // Use the ACCUMULATED KERNEL TIME (total_update_ms) for accuracy
+    double update_seconds = total_update_ms / 1000.0;
+    double tflops_update = (total_flops_update / update_seconds) ;
+    double ai_update = total_flops_update / total_bytes_update; 
 
-    // Time is in seconds (ms / 1000.0)
-    double time_seconds = ms / 1000.0;
-    double tflops_update = (total_flops_update / time_seconds) / 1.0e12;
-    double ai_update = total_flops_update / total_bytes_update;
-
-    // Calculate metrics for Convergence Loop (Reduction)
-    double ai_conv = 1.0 / 16.0; 
-    double tflops_conv = (total_bytes_update / 100.0) / 1.0e12; 
+    // CONVERGENCE LOOP METRICS (Reduction)
+    // Reduce processes 'num_blocks' elements. 
+    // FLOPs: approx 1 comparison per element.
+    // Bytes: approx 1 read (8 bytes) per element. (Strictly read+write for multi-pass, but read dominant).
+    // Note: Reduction is latency bound on small grids, so TFLOPS will be very low.
+    double total_flops_conv = (double)num_blocks * 1.0 * iter;
+    double total_bytes_conv = (double)num_blocks * 8.0 * iter;
+    double conv_seconds = total_conv_ms / 1000.0;
+    
+    // Theoretical AI for simple max reduction: 1 op / 8 bytes = 0.125
+    double ai_conv = 0.125; 
+    double tflops_conv = (total_flops_conv / conv_seconds) / 1.0e12;
 
     cout << "loop_name,AI,TFLOPS" << endl;
     cout << "update_loop," << ai_update << "," << tflops_update << endl;
@@ -341,6 +373,8 @@ int main(int argc, char** argv) {
     checkHipErrors(hipFree(d_tmp1));
     checkHipErrors(hipEventDestroy(start));
     checkHipErrors(hipEventDestroy(stop));
+    checkHipErrors(hipEventDestroy(k_start));
+    checkHipErrors(hipEventDestroy(k_stop));
 
     return 0;
 }

@@ -297,6 +297,13 @@ int main(int argc, char** argv) {
     MPI_Request requests[4];
     MPI_Status statuses[4];
 
+    // --- Performance Tracking (Kernel Timers) ---
+    hipEvent_t k_start, k_stop;
+    checkHipErrors(hipEventCreate(&k_start));
+    checkHipErrors(hipEventCreate(&k_stop));
+    float total_update_ms = 0.0f;
+    float total_conv_ms = 0.0f;
+
     double start_time = MPI_Wtime();
 
     for (iter = 0; iter < MAX_ITER; ++iter) {
@@ -319,10 +326,25 @@ int main(int argc, char** argv) {
             checkHipErrors(hipMemcpy(d_u + ((local_N+1) * N), h_recv_buffer_bottom, row_size, hipMemcpyHostToDevice));
         }
 
+        // Measure Update Kernel (Compute only)
+        checkHipErrors(hipEventRecord(k_start));
         jacobi_mpi<<<gridDim, blockDim, sh_jacobi_bytes>>>(d_u, d_unew, d_f, d_partial_max, N, h, local_N, global_start_row);
+        checkHipErrors(hipEventRecord(k_stop));
+        checkHipErrors(hipEventSynchronize(k_stop));
+        float dt = 0.0f;
+        checkHipErrors(hipEventElapsedTime(&dt, k_start, k_stop));
+        total_update_ms += dt;
+        
         checkHipErrors(hipGetLastError());
 
+        // Measure Convergence Reduction Kernel (Device part only)
+        checkHipErrors(hipEventRecord(k_start));
         double local_max_diff = reduce_final_max(d_partial_max, num_blocks, d_tmp1, &h_local_max);
+        checkHipErrors(hipEventRecord(k_stop));
+        checkHipErrors(hipEventSynchronize(k_stop));
+        checkHipErrors(hipEventElapsedTime(&dt, k_start, k_stop));
+        total_conv_ms += dt;
+
         MPI_Allreduce(&local_max_diff, &global_max_diff, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
 
         std::swap(d_u, d_unew);
@@ -369,18 +391,26 @@ int main(int argc, char** argv) {
             cout << "Result is correct within expected numerical error." << endl;
         }
 
-        double total_flops_update = (double)N * N * 9.0 * iter;
-        double total_bytes_update = (double)N * N * 24.0 * iter;
-        double time_seconds = end_time - start_time;
-        double system_tflops = (total_flops_update / time_seconds) / 1.0e12;
-        double per_gpu_tflops = system_tflops / size;
-        double ai_update = total_flops_update / total_bytes_update;
+        // --- Calculate Roofline Metrics based on Local Rank Performance ---
+        
+        // Update Loop: 9 FLOPs/site, 24 Bytes/site
+        // Note: Using Rank 0's local workload as representative for the system rate per GPU
+        double local_flops_update = (double)local_N * N * 9.0 * iter;
+        double local_bytes_update = (double)local_N * N * 24.0 * iter;
+        double update_seconds = total_update_ms / 1000.0;
+        
+        double tflops_update = (local_flops_update / update_seconds) / 1.0e12;
+        double ai_update = tflops_update / (local_bytes_update / update_seconds);
 
-        double ai_conv = 1.0 / 16.0; 
-        double tflops_conv = per_gpu_tflops * 0.1; 
+        // Convergence Loop: Approx 1 FLOP/block, 8 Bytes/block
+        double local_flops_conv = (double)num_blocks * 1.0 * iter;
+        double conv_seconds = total_conv_ms / 1000.0;
+        
+        double ai_conv = 0.125; // 1 op / 8 bytes
+        double tflops_conv = (local_flops_conv / conv_seconds) / 1.0e12;
 
         cout << "loop_name,AI,TFLOPS" << endl;
-        cout << "update_loop," << ai_update << "," << per_gpu_tflops << endl;
+        cout << "update_loop," << ai_update << "," << tflops_update << endl;
         cout << "convergence_loop," << ai_conv << "," << tflops_conv << endl;
     }
 
@@ -395,6 +425,9 @@ int main(int argc, char** argv) {
     checkHipErrors(hipHostFree(h_send_buffer_bottom));
     checkHipErrors(hipHostFree(h_recv_buffer_top));
     checkHipErrors(hipHostFree(h_recv_buffer_bottom));
+    
+    checkHipErrors(hipEventDestroy(k_start));
+    checkHipErrors(hipEventDestroy(k_stop));
 
     MPI_Finalize();
     return 0;
